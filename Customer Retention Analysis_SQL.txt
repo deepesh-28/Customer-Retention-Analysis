@@ -1,0 +1,219 @@
+-- 'orders' is considered as source table
+
+WITH base AS (
+    -- ----------------------------------------
+    -- 1. Data Cleaning + Feature Engineering
+    -- ----------------------------------------
+    SELECT DISTINCT
+        InvoiceNo,
+        StockCode,
+        Description,
+        Quantity,
+        InvoiceDate,
+        UnitPrice,
+        CustomerID,
+        Country,
+
+        CASE WHEN Quantity < 0 THEN 1 ELSE 0 END AS is_return,
+        CASE WHEN Quantity > 0 THEN Quantity ELSE 0 END AS sale_qty,
+        CASE WHEN Quantity < 0 THEN ABS(Quantity) ELSE 0 END AS return_qty
+
+    FROM orders
+    WHERE CustomerID IS NOT NULL
+      AND InvoiceDate < '2011-12-01'
+),
+
+-- ----------------------------------------
+-- 2. Reference Date
+-- ----------------------------------------
+ref_date AS (
+    SELECT MAX(InvoiceDate) AS max_dt
+    FROM base
+),
+
+-- ----------------------------------------
+-- 3. Customer-Level Aggregation
+-- ----------------------------------------
+customer_agg AS (
+    SELECT
+        CustomerID,
+
+        MAX(CASE WHEN is_return = 0 THEN InvoiceDate END) AS last_purchase_date,
+
+        COUNT(DISTINCT CASE WHEN is_return = 0 THEN InvoiceNo END) AS frequency,
+
+        SUM(sale_qty * UnitPrice) AS total_sales,
+
+        SUM(return_qty * UnitPrice) AS total_returns
+
+    FROM base
+    GROUP BY CustomerID
+),
+
+-- ----------------------------------------
+-- 4. RFM Metrics
+-- ----------------------------------------
+rfm AS (
+    SELECT
+        c.CustomerID,
+
+        DATEDIFF(day, c.last_purchase_date, r.max_dt) AS recency,
+
+        c.frequency,
+
+        (c.total_sales - c.total_returns) AS monetary
+
+    FROM customer_agg c
+    CROSS JOIN ref_date r
+),
+
+-- ----------------------------------------
+-- 5. RFM Scoring
+-- ----------------------------------------
+rfm_scores AS (
+    SELECT
+        *,
+        NTILE(4) OVER (ORDER BY recency DESC) AS r_score,   -- lower recency = better
+        NTILE(4) OVER (ORDER BY frequency ASC) AS f_score,
+        NTILE(4) OVER (ORDER BY monetary ASC) AS m_score
+    FROM rfm
+),
+
+-- ----------------------------------------
+-- 6. Customer Segmentation
+-- ----------------------------------------
+rfm_segment AS (
+    SELECT
+        *,
+        CASE
+            WHEN r_score >= 3 AND f_score >= 3 AND m_score >= 3 THEN 'High Value'
+            WHEN r_score <= 2 AND f_score >= 3 THEN 'At Risk'
+            WHEN r_score = 1 AND f_score <= 2 THEN 'Lost'
+            ELSE 'Others'
+        END AS segment
+    FROM rfm_scores
+),
+
+-- ----------------------------------------
+-- 7. Latest Country per Customer
+-- ----------------------------------------
+latest_country AS (
+    SELECT CustomerID, Country
+    FROM (
+        SELECT
+            CustomerID,
+            Country,
+            InvoiceDate,
+            ROW_NUMBER() OVER (
+                PARTITION BY CustomerID 
+                ORDER BY InvoiceDate DESC
+            ) AS rn
+        FROM base
+        WHERE is_return = 0
+    ) t
+    WHERE rn = 1
+),
+
+-- ----------------------------------------
+-- 8. Churn (90-day inactivity)
+-- ----------------------------------------
+churn AS (
+    SELECT
+        r.*,
+        c.Country,
+        CASE WHEN r.recency > 90 THEN 1 ELSE 0 END AS is_churned
+    FROM rfm_segment r
+    LEFT JOIN latest_country c
+        ON r.CustomerID = c.CustomerID
+),
+
+-- ----------------------------------------
+-- 9. Cohort Base (Monthly Activity)
+-- ----------------------------------------
+cohort_base AS (
+    SELECT DISTINCT
+        CustomerID,
+        DATE_TRUNC('month', InvoiceDate) AS sale_month
+    FROM base
+    WHERE is_return = 0
+),
+
+-- ----------------------------------------
+-- 10. Cohort Assignment
+-- ----------------------------------------
+cohort AS (
+    SELECT
+        CustomerID,
+        sale_month,
+        MIN(sale_month) OVER (PARTITION BY CustomerID) AS cohort_month
+    FROM cohort_base
+),
+
+-- ----------------------------------------
+-- 11. Cohort Index (Months since first purchase)
+-- ----------------------------------------
+cohort_indexed AS (
+    SELECT
+        CustomerID,
+        cohort_month,
+        sale_month,
+
+        (EXTRACT(YEAR FROM sale_month) - EXTRACT(YEAR FROM cohort_month)) * 12 +
+        (EXTRACT(MONTH FROM sale_month) - EXTRACT(MONTH FROM cohort_month)) AS cohort_index
+
+    FROM cohort
+),
+
+-- ----------------------------------------
+-- 12. Cohort Counts
+-- ----------------------------------------
+cohort_counts AS (
+    SELECT
+        cohort_month,
+        cohort_index,
+        COUNT(DISTINCT CustomerID) AS customers
+    FROM cohort_indexed
+    GROUP BY cohort_month, cohort_index
+),
+
+-- ----------------------------------------
+-- 13. Cohort Size (Month 0)
+-- ----------------------------------------
+cohort_size AS (
+    SELECT
+        cohort_month,
+        customers AS cohort_size
+    FROM cohort_counts
+    WHERE cohort_index = 0
+),
+
+-- ----------------------------------------
+-- 14. Retention %
+-- ----------------------------------------
+cohort_retention AS (
+    SELECT
+        c.cohort_month,
+        c.cohort_index,
+        c.customers,
+        ROUND(100.0 * c.customers / s.cohort_size, 2) AS retention_pct
+    FROM cohort_counts c
+    JOIN cohort_size s
+        ON c.cohort_month = s.cohort_month
+)
+
+-- =========================================
+-- FINAL OUTPUT OPTIONS
+-- =========================================
+
+--  1. RFM + Segment + Churn
+SELECT * FROM churn;
+
+--  2. Cohort Retention Table
+-- SELECT * FROM cohort_retention;
+
+--  3. Revenue Contribution
+-- SELECT
+--     SUM(monetary) AS total_revenue,
+--     SUM(CASE WHEN m_score = 4 THEN monetary ELSE 0 END) AS top25_revenue,
+--     ROUND(100.0 * SUM(CASE WHEN m_score = 4 THEN monetary ELSE 0 END) / SUM(monetary), 2) AS pct_top25
+-- FROM rfm_segment;
