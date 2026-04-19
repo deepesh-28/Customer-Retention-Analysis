@@ -109,7 +109,7 @@ Customers are segmented into:
 * Lost
 * Others
 
-Segmentation is based on behavioral patterns derived from purchase activity.
+Segmentation is based on behavioral patterns derived from purchase activity using RFM analysis.
 
 ---
 
@@ -154,6 +154,7 @@ An interactive dashboard is built to present:
 ## Skills Demonstrated
 
 * Cohort Analysis
+* RFM Analysis
 * Customer Retention Metrics
 * Data Cleaning & Transformation
 * SQL Window Functions
